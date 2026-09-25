@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - [connect] Retain playback snapshots after an unexpected disconnect so clients can restore context, shuffle order, and queued tracks on a new session
+- [playback] Report completed and interrupted decoded Spotify playback to listening history; add `Player::stop_and_flush` to drain reports before runtime shutdown. Passthrough output and local files are not reported.
 - [core] Add an in-memory credential cache for clients that persist grants in a protected store
 - [core] Add method `get_playlist_range` to `SpClient` for a window of a playlist's items with its header decorated on
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
