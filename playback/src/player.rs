@@ -1693,10 +1693,19 @@ impl Future for PlayerInternal {
 }
 
 impl PlayerInternal {
+    fn set_listening(&mut self, mut statistics: Option<PlaybackStatistics>) {
+        if let Some(statistics) = &mut statistics {
+            statistics.configure_output(self.sink.as_mut());
+        } else {
+            self.sink.set_rendered_audio(None);
+        }
+        self.listening = statistics;
+    }
+
     fn take_listening(&mut self, reason: EndReason) -> Option<ReportCommand> {
         self.listening
             .take()
-            .and_then(|stats| stats.finish(reason, SystemTime::now()))
+            .and_then(|stats| stats.pending(reason, SystemTime::now()))
             .map(|report| {
                 ReportCommand::Report(
                     self.listening_generation,
@@ -2011,13 +2020,14 @@ impl PlayerInternal {
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
     ) {
-        self.listening = loaded_track.audio_file.map(|file| {
+        let listening = loaded_track.audio_file.map(|file| {
             PlaybackStatistics::new(
                 loaded_track.audio_item.track_id.clone(),
                 file,
                 self.context_uri.clone(),
             )
         });
+        self.set_listening(listening);
         let audio_item = Box::new(loaded_track.audio_item.clone());
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
@@ -2465,7 +2475,7 @@ impl PlayerInternal {
                 self.finish_listening(EndReason::EndPlay);
                 self.session = session;
                 self.listening_generation = self.listening_generation.wrapping_add(1);
-                self.listening = remaining;
+                self.set_listening(remaining);
             }
 
             PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),

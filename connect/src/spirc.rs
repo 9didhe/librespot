@@ -735,6 +735,12 @@ impl SpircTask {
         match cmd {
             SpircCommand::Shutdown => {
                 trace!("Received SpircCommand::Shutdown");
+                // Reject new commands before the final drain. This branch
+                // owns the event loop, so no remote transition can run either.
+                self.shutdown = true;
+                if let Some(rx) = self.commands.as_mut() {
+                    rx.close()
+                }
                 if let Err(error) =
                     tokio::time::timeout(Duration::from_secs(10), self.player.stop_and_flush())
                         .await
@@ -743,10 +749,6 @@ impl SpircTask {
                         })
                 {
                     warn!("Unable to flush listening on shutdown: {error}");
-                }
-                self.shutdown = true;
-                if let Some(rx) = self.commands.as_mut() {
-                    rx.close()
                 }
                 self.handle_disconnect().await?;
             }
