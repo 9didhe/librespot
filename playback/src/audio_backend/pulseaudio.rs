@@ -69,6 +69,7 @@ struct PulseOutput {
     stream: Simple,
     clock: Mutex<RenderedQueue>,
     closed: AtomicBool,
+    timing_failed: AtomicBool,
 }
 
 impl PulseOutput {
@@ -96,7 +97,10 @@ fn observe_playback(output: Weak<PulseOutput>) {
         let timing = if pending { output.observe() } else { Ok(()) };
         if let Err(error) = timing {
             warn!("Unable to read PulseAudio playback timing: {error}");
-            output.discard();
+            // Timing is only for reporting. Losing it must not interrupt a
+            // stream that can still play; discard unconfirmed frames instead.
+            output.timing_failed.store(true, Ordering::Release);
+            output.clock.lock().unwrap().discard();
             break;
         }
         // No strong output reference is kept between ticks. A stalled native
@@ -182,6 +186,7 @@ impl Sink for PulseAudioSink {
                 stream: sink,
                 clock: Mutex::new(RenderedQueue::new(SAMPLE_RATE)),
                 closed: AtomicBool::new(false),
+                timing_failed: AtomicBool::new(false),
             });
             let observer = Arc::downgrade(&output);
             thread::Builder::new()
@@ -236,7 +241,9 @@ impl SinkAsBytes for PulseAudioSink {
         if sink.closed.load(Ordering::Acquire) {
             return Err(PulseError::NotConnected.into());
         }
-        clock.submit(frames as u64, self.rendered_audio.as_ref());
+        if !sink.timing_failed.load(Ordering::Acquire) {
+            clock.submit(frames as u64, self.rendered_audio.as_ref());
+        }
 
         Ok(())
     }
