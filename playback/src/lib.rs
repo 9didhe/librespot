@@ -14,6 +14,8 @@ pub mod listening;
 mod local_file;
 pub mod mixer;
 pub mod player;
+#[cfg(any(feature = "pulseaudio-backend", test))]
+mod rendered_queue;
 mod symphonia_util;
 
 pub const SAMPLE_RATE: u32 = 44100;

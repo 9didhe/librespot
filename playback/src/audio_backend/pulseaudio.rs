@@ -2,10 +2,20 @@ use super::{Open, Sink, SinkAsBytes, SinkError, SinkResult};
 use crate::config::AudioFormat;
 use crate::convert::Converter;
 use crate::decoder::AudioPacket;
+use crate::listening::RenderedAudio;
+use crate::rendered_queue::RenderedQueue;
 use crate::{NUM_CHANNELS, SAMPLE_RATE};
 use libpulse_binding::{self as pulse, error::PAErr, stream::Direction};
 use libpulse_simple_binding::Simple;
-use std::env;
+use std::{
+    env,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -47,11 +57,53 @@ impl From<PulseError> for SinkError {
 }
 
 pub struct PulseAudioSink {
-    sink: Option<Simple>,
+    sink: Option<Arc<PulseOutput>>,
+    rendered_audio: Option<Arc<RenderedAudio>>,
     device: Option<String>,
     app_name: String,
     stream_desc: String,
     format: AudioFormat,
+}
+
+struct PulseOutput {
+    stream: Simple,
+    clock: Mutex<RenderedQueue>,
+    closed: AtomicBool,
+}
+
+impl PulseOutput {
+    fn observe(&self) -> Result<(), PAErr> {
+        let submitted = self.clock.lock().unwrap().submitted();
+        // Simple is Send + Sync and protects its Pulse mainloop internally.
+        // Do not hold our FIFO mutex across this potentially blocking call.
+        let latency = self.stream.get_latency()?;
+        self.clock.lock().unwrap().observe(submitted, latency.0);
+        Ok(())
+    }
+
+    fn discard(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.clock.lock().unwrap().discard();
+    }
+}
+
+fn observe_playback(output: Weak<PulseOutput>) {
+    while let Some(output) = output.upgrade() {
+        if output.closed.load(Ordering::Acquire) {
+            break;
+        }
+        let pending = output.clock.lock().unwrap().pending();
+        let timing = if pending { output.observe() } else { Ok(()) };
+        if let Err(error) = timing {
+            warn!("Unable to read PulseAudio playback timing: {error}");
+            output.discard();
+            break;
+        }
+        // No strong output reference is kept between ticks. A stalled native
+        // call may outlive shutdown, so this observer is never joined by Drop.
+        drop(output);
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 impl Open for PulseAudioSink {
@@ -70,6 +122,7 @@ impl Open for PulseAudioSink {
 
         Self {
             sink: None,
+            rendered_audio: None,
             device,
             app_name,
             stream_desc,
@@ -79,6 +132,11 @@ impl Open for PulseAudioSink {
 }
 
 impl Sink for PulseAudioSink {
+    fn set_rendered_audio(&mut self, audio: Option<Arc<RenderedAudio>>) -> bool {
+        self.rendered_audio = audio;
+        true
+    }
+
     fn start(&mut self) -> SinkResult<()> {
         if self.sink.is_none() {
             // PulseAudio calls S24 and S24_3 different from the rest of the world
@@ -120,7 +178,17 @@ impl Sink for PulseAudioSink {
             )
             .map_err(PulseError::ConnectionRefused)?;
 
-            self.sink = Some(sink);
+            let output = Arc::new(PulseOutput {
+                stream: sink,
+                clock: Mutex::new(RenderedQueue::new(SAMPLE_RATE)),
+                closed: AtomicBool::new(false),
+            });
+            let observer = Arc::downgrade(&output);
+            thread::Builder::new()
+                .name("librespot-pulse-clock".into())
+                .spawn(move || observe_playback(observer))
+                .map_err(|error| SinkError::ConnectionRefused(error.to_string()))?;
+            self.sink = Some(output);
         }
 
         Ok(())
@@ -129,8 +197,17 @@ impl Sink for PulseAudioSink {
     fn stop(&mut self) -> SinkResult<()> {
         let sink = self.sink.take().ok_or(PulseError::NotConnected)?;
 
-        sink.drain().map_err(PulseError::DrainFailure)?;
-        Ok(())
+        match sink.stream.drain() {
+            Ok(()) => {
+                sink.closed.store(true, Ordering::Release);
+                sink.clock.lock().unwrap().drained();
+                Ok(())
+            }
+            Err(error) => {
+                sink.discard();
+                Err(PulseError::DrainFailure(error).into())
+            }
+        }
     }
 
     sink_as_bytes!();
@@ -141,9 +218,35 @@ impl SinkAsBytes for PulseAudioSink {
     fn write_bytes(&mut self, data: &[u8]) -> SinkResult<()> {
         let sink = self.sink.as_mut().ok_or(PulseError::NotConnected)?;
 
-        sink.write(data).map_err(PulseError::OnWrite)?;
+        if sink.closed.load(Ordering::Acquire) {
+            return Err(PulseError::NotConnected.into());
+        }
+        if let Err(error) = sink.stream.write(data) {
+            sink.discard();
+            return Err(PulseError::OnWrite(error).into());
+        }
+        let bytes_per_sample = match self.format {
+            AudioFormat::F32 | AudioFormat::S32 | AudioFormat::S24 => 4,
+            AudioFormat::S24_3 => 3,
+            AudioFormat::S16 => 2,
+            _ => unreachable!(),
+        };
+        let frames = data.len() / (bytes_per_sample * usize::from(NUM_CHANNELS));
+        let mut clock = sink.clock.lock().unwrap();
+        if sink.closed.load(Ordering::Acquire) {
+            return Err(PulseError::NotConnected.into());
+        }
+        clock.submit(frames as u64, self.rendered_audio.as_ref());
 
         Ok(())
+    }
+}
+
+impl Drop for PulseAudioSink {
+    fn drop(&mut self) {
+        if let Some(sink) = &self.sink {
+            sink.discard();
+        }
     }
 }
 

@@ -1,8 +1,8 @@
-name: Fastpotify playback connections
+name: Playback connections and listening reports
 
 on:
   push:
-    branches: [fastpotify-0.8]
+    branches: [fastpotify-0.8, codex/spotifast-v0.12.0-reporting]
   workflow_dispatch:
 
 permissions:
@@ -10,9 +10,9 @@ permissions:
 
 jobs:
   socket:
-    name: Socket regressions (${{ matrix.os }})
+    name: Playback regressions (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -21,7 +21,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: PulseAudio development library
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpulse-dev
       # Run the dependency's own tests on native hosts. Downstream Cargo test
       # does not run these private socket tests, or their resolver fixtures.
-      - name: Core tests with Fastpotify's TLS backend
+      - name: Core connection tests
         run: cargo test --locked -p librespot-core --no-default-features --features rustls-tls-native-roots --lib
+      - name: Listening and lifecycle tests (PulseAudio)
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p librespot-playback --no-default-features --features pulseaudio-backend,rustls-tls-native-roots --lib
+      - name: Listening and lifecycle tests
+        if: runner.os != 'Linux'
+        run: cargo test --locked -p librespot-playback --no-default-features --features rustls-tls-native-roots --lib
+      - name: Connect tests
+        run: cargo test --locked -p librespot-connect --no-default-features --features rustls-tls-native-roots --lib

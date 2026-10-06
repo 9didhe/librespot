@@ -40,7 +40,7 @@ use librespot_metadata::{audio::UniqueFields, track::Tracks};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::SAMPLES_PER_SECOND;
 
@@ -60,6 +60,7 @@ pub struct Player {
     commands: Option<mpsc::UnboundedSender<PlayerCommand>>,
     thread_handle: Option<thread::JoinHandle<()>>,
     flush_lock: tokio::sync::Mutex<()>,
+    finalized: watch::Sender<bool>,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -81,6 +82,7 @@ struct PlayerInternal {
     config: PlayerConfig,
     commands: mpsc::UnboundedReceiver<PlayerCommand>,
     load_handles: Arc<Mutex<HashMap<thread::ThreadId, thread::JoinHandle<()>>>>,
+    finalized: watch::Receiver<bool>,
 
     state: PlayerState,
     preload: PlayerPreload,
@@ -461,6 +463,7 @@ impl Player {
         F: FnOnce() -> Box<dyn Sink> + Send + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (finalize, finalized) = watch::channel(false);
 
         if config.normalisation {
             debug!("Normalisation Type: {:?}", config.normalisation_type);
@@ -502,7 +505,7 @@ impl Player {
                 create_local_file_lookup(config.local_file_directories.as_slice());
 
             let internal = PlayerInternal {
-                listening_reports: listening::reporter(session.clone()),
+                listening_reports: listening::reporter(session.clone(), finalized.clone()),
                 listening: None,
                 listening_generation: 0,
                 listening_error: None,
@@ -511,6 +514,7 @@ impl Player {
                 config,
                 commands: cmd_rx,
                 load_handles: Arc::new(Mutex::new(HashMap::new())),
+                finalized,
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
@@ -547,10 +551,14 @@ impl Player {
             commands: Some(cmd_tx),
             thread_handle: Some(handle),
             flush_lock: tokio::sync::Mutex::new(()),
+            finalized: finalize,
         })
     }
 
     pub fn is_invalid(&self) -> bool {
+        if *self.finalized.borrow() {
+            return true;
+        }
         if let Some(handle) = self.thread_handle.as_ref() {
             return handle.is_finished();
         }
@@ -558,6 +566,9 @@ impl Player {
     }
 
     fn command(&self, cmd: PlayerCommand) {
+        if *self.finalized.borrow() {
+            return;
+        }
         if let Some(commands) = self.commands.as_ref() {
             if let Err(e) = commands.send(cmd) {
                 error!("Player Commands Error: {e}");
@@ -605,10 +616,30 @@ impl Player {
     /// Stops playback and waits for all queued listening reports, including the
     /// final partial listen. Call before shutting down the session or runtime.
     pub async fn stop_and_flush(&self) -> PlayerResult {
+        if *self.finalized.borrow() {
+            return Err(Error::aborted("Player was finalized"));
+        }
         let _flush = self.flush_lock.lock().await;
+        if *self.finalized.borrow() {
+            return Err(Error::aborted("Player was finalized"));
+        }
         let (done, completed) = oneshot::channel();
         self.command(PlayerCommand::StopAndFlush(done));
         completed.await?.flush().await
+    }
+
+    /// Finish this player's lifetime without waiting for native output or
+    /// decoder calls that cannot be interrupted. Call after `stop_and_flush`,
+    /// or after its application-level deadline expires, and after stopping the
+    /// Connect producer. This is terminal: commands, loaders and reports stop.
+    /// A blocked native call may retain its thread until it returns, but cannot
+    /// start further playback afterward. Ordinary `Drop` still joins threads.
+    pub fn finalize_shutdown(&self) {
+        self.finalized.send_replace(true);
+        // Wake an idle player without allowing queued commands to run first.
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(PlayerCommand::Stop);
+        }
     }
 
     pub fn seek(&self, position_ms: u32) {
@@ -700,6 +731,10 @@ impl Drop for Player {
         debug!("Shutting down player thread ...");
         self.commands = None;
         if let Some(handle) = self.thread_handle.take() {
+            if *self.finalized.borrow() && !handle.is_finished() {
+                debug!("Finalized player thread will release its native output when it returns");
+                return;
+            }
             if let Err(e) = handle.join() {
                 error!("Player thread Error: {e:?}");
             }
@@ -1420,6 +1455,9 @@ impl Future for PlayerInternal {
         let passthrough = self.config.passthrough;
 
         loop {
+            if *self.finalized.borrow() {
+                return Poll::Ready(());
+            }
             let mut all_futures_completed_or_not_ready = true;
 
             // process commands that were sent to us
@@ -1436,6 +1474,9 @@ impl Future for PlayerInternal {
                 if let Err(e) = self.handle_command(cmd) {
                     error!("Error handling command: {e}");
                 }
+            }
+            if *self.finalized.borrow() {
+                return Poll::Ready(());
             }
 
             // Handle loading of a new track to play
@@ -1459,6 +1500,9 @@ impl Future for PlayerInternal {
                                 loaded_track,
                                 start_playback,
                             );
+                            if *self.finalized.borrow() {
+                                return Poll::Ready(());
+                            }
                             if let PlayerState::Loading { .. } = self.state {
                                 error!("The state wasn't changed by start_playback()");
                                 exit(1);
@@ -1527,6 +1571,9 @@ impl Future for PlayerInternal {
 
             if self.state.is_playing() {
                 self.ensure_sink_running();
+                if *self.finalized.borrow() {
+                    return Poll::Ready(());
+                }
 
                 if let PlayerState::Playing {
                     ref track_id,
@@ -1727,12 +1774,19 @@ impl PlayerInternal {
     }
 
     fn ensure_sink_running(&mut self) {
+        if *self.finalized.borrow() {
+            return;
+        }
         if self.sink_status != SinkStatus::Running {
             trace!("== Starting sink ==");
             if let Some(callback) = &mut self.sink_event_callback {
                 callback(SinkStatus::Running);
             }
-            match self.sink.start() {
+            let result = self.sink.start();
+            if *self.finalized.borrow() {
+                return;
+            }
+            match result {
                 Ok(()) => self.sink_status = SinkStatus::Running,
                 Err(e) => {
                     error!("{e}");
@@ -1878,6 +1932,9 @@ impl PlayerInternal {
         packet: Option<(AudioPacketPosition, AudioPacket)>,
         normalisation_factor: f64,
     ) {
+        if *self.finalized.borrow() {
+            return;
+        }
         match packet {
             Some((_, mut packet)) => {
                 if !packet.is_empty() {
@@ -1978,7 +2035,11 @@ impl PlayerInternal {
                         AudioPacket::Samples(data) => data.len(),
                         AudioPacket::Raw(_) => 0,
                     };
-                    match self.sink.write(packet, &mut self.converter) {
+                    let result = self.sink.write(packet, &mut self.converter);
+                    if *self.finalized.borrow() {
+                        return;
+                    }
+                    match result {
                         Ok(()) => {
                             if let Some(stats) = &mut self.listening {
                                 stats.written(samples, SystemTime::now());
@@ -2020,6 +2081,9 @@ impl PlayerInternal {
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
     ) {
+        if *self.finalized.borrow() {
+            return;
+        }
         let listening = loaded_track.audio_file.map(|file| {
             PlaybackStatistics::new(
                 loaded_track.audio_item.track_id.clone(),
@@ -2438,6 +2502,9 @@ impl PlayerInternal {
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
+        if *self.finalized.borrow() {
+            return Ok(());
+        }
         debug!("command={cmd:?}");
         match cmd {
             PlayerCommand::Load {
@@ -2592,10 +2659,18 @@ impl PlayerInternal {
 
         let load_handles_clone = self.load_handles.clone();
         let handle = tokio::runtime::Handle::current();
+        let finalized = self.finalized.clone();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
-            let _ = result_tx.send(data);
+            let data = handle.block_on(listening::until_finalized(
+                finalized.clone(),
+                loader.load_track(spotify_uri, position_ms),
+            ));
+            if !*finalized.borrow()
+                && let Some(data) = data
+            {
+                let _ = result_tx.send(data);
+            }
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
             load_handles.remove(&thread::current().id());
@@ -2634,7 +2709,9 @@ impl PlayerInternal {
 
 impl Drop for PlayerInternal {
     fn drop(&mut self) {
-        self.finish_listening(EndReason::EndPlay);
+        if !*self.finalized.borrow() {
+            self.finish_listening(EndReason::EndPlay);
+        }
         debug!("drop PlayerInternal[{}]", self.player_id);
 
         let handles: Vec<thread::JoinHandle<()>> = {
@@ -2648,7 +2725,9 @@ impl Drop for PlayerInternal {
         };
 
         for handle in handles {
-            let _ = handle.join();
+            if !*self.finalized.borrow() || handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -2844,8 +2923,95 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadError, PlayerEvent, PlayerTrackLoader};
+    use super::{LoadError, Player, PlayerCommand, PlayerEvent, PlayerTrackLoader};
     use crate::core::{Error, SpotifyUri, audio_key::AudioKeyError};
+
+    fn player_with_thread(
+        thread_handle: Option<std::thread::JoinHandle<()>>,
+    ) -> (Player, tokio::sync::mpsc::UnboundedReceiver<PlayerCommand>) {
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (finalized, _) = tokio::sync::watch::channel(false);
+        (
+            Player {
+                commands: Some(commands),
+                thread_handle,
+                flush_lock: tokio::sync::Mutex::new(()),
+                finalized,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn finalized_player_drop_does_not_join_a_stalled_native_thread() {
+        let (release, released) = std::sync::mpsc::channel();
+        let (native_done, native_finished) = std::sync::mpsc::channel();
+        let native = std::thread::spawn(move || {
+            released.recv().unwrap();
+            native_done.send(()).unwrap();
+        });
+        let (player, _commands) = player_with_thread(Some(native));
+        let (dropped, finished) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            player.finalize_shutdown();
+            drop(player);
+            dropped.send(()).unwrap();
+        });
+        let bounded = finished
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        // Release the stand-in native call even when the assertion would fail.
+        release.send(()).unwrap();
+        native_finished
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        dropper.join().unwrap();
+        assert!(bounded, "finalized Drop must not wait for native output");
+    }
+
+    #[test]
+    fn ordinary_player_drop_still_joins_its_native_thread() {
+        let (release, released) = std::sync::mpsc::channel();
+        let native = std::thread::spawn(move || {
+            released.recv().unwrap();
+        });
+        let (player, _commands) = player_with_thread(Some(native));
+        let (dropping, began_drop) = std::sync::mpsc::channel();
+        let (dropped, finished) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            dropping.send(()).unwrap();
+            drop(player);
+            dropped.send(()).unwrap();
+        });
+        began_drop.recv().unwrap();
+        let waited = finished
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err();
+        release.send(()).unwrap();
+        if waited {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        }
+        dropper.join().unwrap();
+        assert!(waited, "ordinary Drop retains its existing join semantics");
+    }
+
+    #[tokio::test]
+    async fn finalization_rejects_new_playback_and_flush_commands() {
+        let (player, mut commands) = player_with_thread(None);
+        player.finalize_shutdown();
+        assert!(matches!(commands.try_recv(), Ok(PlayerCommand::Stop)));
+        player.play();
+        player.load(
+            SpotifyUri::from_uri("spotify:track:14XWXWv5FoCbFzLksawpEe").unwrap(),
+            true,
+            0,
+        );
+        assert!(commands.try_recv().is_err(), "finalization is terminal");
+        assert!(player.is_invalid());
+        assert!(player.stop_and_flush().await.is_err());
+    }
 
     #[test]
     fn only_an_explicit_audio_key_rejection_is_terminal() {

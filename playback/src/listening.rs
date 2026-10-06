@@ -11,7 +11,30 @@ use librespot_core::{
     listening::{EndReason, ListeningReporter, PlaybackReport},
 };
 use librespot_metadata::audio::AudioFileFormat;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// An explicit finalization cancels work, while ordinary sender closure leaves
+/// queued reports and loaders to finish with the player's existing semantics.
+pub(crate) async fn until_finalized<T>(
+    mut finalized: watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let cancellation = async {
+        loop {
+            if *finalized.borrow() {
+                return;
+            }
+            if finalized.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        () = cancellation => None,
+        result = work => Some(result),
+    }
+}
 
 pub(crate) enum ReportCommand {
     Report(u64, Session, Box<PendingReport>),
@@ -210,13 +233,16 @@ impl Drop for RenderedChunk {
     }
 }
 
-pub(crate) fn reporter(session: Session) -> mpsc::Sender<ReportCommand> {
+pub(crate) fn reporter(
+    session: Session,
+    finalized: watch::Receiver<bool>,
+) -> mpsc::Sender<ReportCommand> {
     let (sender, receiver) = mpsc::channel(32);
     let reporter = SessionReporter {
         generation: 0,
         reporter: ListeningReporter::new(session.clone()),
     };
-    session.spawn(run_reports(receiver, reporter));
+    session.spawn(until_finalized(finalized, run_reports(receiver, reporter)));
     sender
 }
 
@@ -344,6 +370,110 @@ impl PendingReport {
 mod tests {
     use super::*;
     use crate::SAMPLES_PER_SECOND;
+
+    #[tokio::test]
+    async fn finalized_work_is_never_polled() {
+        let (_, finalized) = watch::channel(true);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let observed = polled.clone();
+        let result = until_finalized(finalized, async move {
+            polled.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(result, None);
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn finalization_cancels_a_pending_loader_without_delivering_its_result() {
+        let (finalize, finalized) = watch::channel(false);
+        let (held, released) = oneshot::channel::<()>();
+        let loader = tokio::spawn(until_finalized(finalized, async move {
+            let _held_while_loading = held;
+            std::future::pending::<()>().await;
+            "loaded track"
+        }));
+        tokio::task::yield_now().await;
+        finalize.send_replace(true);
+        assert!(loader.await.unwrap().is_none());
+        assert!(released.await.is_err(), "loading future was dropped");
+    }
+
+    #[tokio::test]
+    async fn ordinary_player_closure_keeps_queued_reports_until_completion() {
+        let (finalize, finalized) = watch::channel(false);
+        drop(finalize);
+        let (sender, receiver) = mpsc::channel(4);
+        let reports = Arc::new(AtomicUsize::new(0));
+        struct CountingReporter(Arc<AtomicUsize>);
+        impl ReportSink for CountingReporter {
+            async fn report(&mut self, _: u64, _: Session, _: PlaybackReport) -> Result<(), Error> {
+                tokio::task::yield_now().await;
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let mut statistics = loaded();
+        statistics.written(SAMPLES_PER_SECOND as usize, SystemTime::now());
+        sender
+            .send(ReportCommand::Report(
+                0,
+                Session::new(Default::default(), None),
+                Box::new(
+                    statistics
+                        .pending(EndReason::TrackDone, SystemTime::now())
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        drop(sender);
+        assert!(
+            until_finalized(
+                finalized,
+                run_reports(receiver, CountingReporter(reports.clone()))
+            )
+            .await
+            .is_some()
+        );
+        assert_eq!(reports.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn finalization_cancels_a_pending_report_and_closes_its_queue() {
+        let (finalize, finalized) = watch::channel(false);
+        let (sender, receiver) = mpsc::channel(4);
+        let (started, reporting) = oneshot::channel();
+        struct PendingReporter(Option<oneshot::Sender<()>>);
+        impl ReportSink for PendingReporter {
+            async fn report(&mut self, _: u64, _: Session, _: PlaybackReport) -> Result<(), Error> {
+                self.0.take().unwrap().send(()).unwrap();
+                std::future::pending().await
+            }
+        }
+        let mut statistics = loaded();
+        statistics.written(SAMPLES_PER_SECOND as usize, SystemTime::now());
+        sender
+            .send(ReportCommand::Report(
+                0,
+                Session::new(Default::default(), None),
+                Box::new(
+                    statistics
+                        .pending(EndReason::EndPlay, SystemTime::now())
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let task = tokio::spawn(until_finalized(
+            finalized,
+            run_reports(receiver, PendingReporter(Some(started))),
+        ));
+        reporting.await.unwrap();
+        finalize.send_replace(true);
+        assert!(task.await.unwrap().is_none());
+        assert!(sender.is_closed());
+    }
 
     fn loaded() -> PlaybackStatistics {
         PlaybackStatistics::new(
