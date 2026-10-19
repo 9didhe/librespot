@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- [playback] Resample stereo local files to 44.1 kHz, including the final audio frames, and clear the resampler history when seeking
+
 ### Added
 
 - [core] Add `SpClient::get_buddylist` and `SpClient::get_listening_activity` to read what the people the user follows are listening to
