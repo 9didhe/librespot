@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [connect] Retain playback snapshots after an unexpected disconnect so clients can restore context, shuffle order, and queued tracks on a new session
 - [connect] Add `PlaybackSnapshot::at_position`, `position_ms` and `is_playing`, to restore a snapshot where a player kept across the reconnect has got to
 - [connect] Add method `add_to_queue` to `Spirc` to add tracks, episodes, albums and playlists to the queue
+- [connect] `Spirc::add_to_queue` also queues local files (`spotify:local:` URIs), which play from `PlayerConfig::local_file_directories` as they do in a context
 - [connect] Add method `clear_queue` to `Spirc` to remove all manually queued tracks
 - [core] Add method `get_playlist_range` to `SpClient` to fetch a window of a playlist's items with its header decorated on
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
