@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [connect] `Spirc::add_to_queue` also queues local files (`spotify:local:` URIs), which play from `PlayerConfig::local_file_directories` as they do in a context
 - [connect] Add method `clear_queue` to `Spirc` to remove all manually queued tracks
 - [core] Add method `get_playlist_range` to `SpClient` to fetch a window of a playlist's items with its header decorated on
+- [playback] Report completed and interrupted decoded Spotify playback to listening history; add `Player::stop_and_flush` to drain reports before runtime shutdown. Passthrough output and local files are not reported.
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
 - [connect] Add method `remove_next_track` to `Spirc` to remove a single upcoming track, queued or from the context
 - [connect] Add broadcast/watch channels to `Spirc` for observing remote player, cluster, and queue state independent of whether this device is active

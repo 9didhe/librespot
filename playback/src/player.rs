@@ -14,7 +14,7 @@ use std::{
     },
     task::{Context, Poll},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[cfg(feature = "passthrough-decoder")]
@@ -30,6 +30,7 @@ use crate::{
         util::SeqGenerator,
     },
     decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
+    listening::{self, LoadedAudioFile, PendingFlush, PlaybackStatistics, ReportCommand},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
@@ -38,11 +39,12 @@ use futures_util::{
     FutureExt, StreamExt, TryFutureExt, future, future::FusedFuture,
     stream::futures_unordered::FuturesUnordered,
 };
+use librespot_core::listening::EndReason;
 use librespot_metadata::{audio::UniqueFields, track::Tracks};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::SAMPLES_PER_SECOND;
 
@@ -70,6 +72,8 @@ pub type PlayerResult = Result<(), Error>;
 pub struct Player {
     commands: Option<mpsc::UnboundedSender<PlayerCommand>>,
     thread_handle: Option<thread::JoinHandle<()>>,
+    flush_lock: tokio::sync::Mutex<()>,
+    finalized: watch::Sender<bool>,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -83,9 +87,15 @@ pub type SinkEventCallback = Box<dyn Fn(SinkStatus) + Send>;
 
 struct PlayerInternal {
     session: Session,
+    listening_reports: mpsc::Sender<ReportCommand>,
+    listening: Option<PlaybackStatistics>,
+    listening_generation: u64,
+    listening_error: Option<Error>,
+    context_uri: Option<String>,
     config: PlayerConfig,
     commands: mpsc::UnboundedReceiver<PlayerCommand>,
     load_handles: Arc<Mutex<HashMap<thread::ThreadId, thread::JoinHandle<()>>>>,
+    finalized: watch::Receiver<bool>,
 
     state: PlayerState,
     preload: PlayerPreload,
@@ -147,6 +157,7 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        context_uri: Option<String>,
     },
     Preload {
         track_id: SpotifyUri,
@@ -155,6 +166,7 @@ enum PlayerCommand {
     Play,
     Pause,
     Stop,
+    StopAndFlush(oneshot::Sender<PendingFlush>),
     Seek(u32),
     SetSession(Session),
     AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
@@ -515,6 +527,7 @@ impl Player {
         F: FnOnce() -> Box<dyn Sink> + Send + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (finalize, finalized) = watch::channel(false);
 
         if config.normalisation {
             debug!("Normalisation Type: {:?}", config.normalisation_type);
@@ -556,10 +569,16 @@ impl Player {
                 create_local_file_lookup(config.local_file_directories.as_slice());
 
             let internal = PlayerInternal {
+                listening_reports: listening::reporter(session.clone(), finalized.clone()),
+                listening: None,
+                listening_generation: 0,
+                listening_error: None,
+                context_uri: None,
                 session,
                 config,
                 commands: cmd_rx,
                 load_handles: Arc::new(Mutex::new(HashMap::new())),
+                finalized,
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
@@ -596,10 +615,15 @@ impl Player {
         Arc::new(Self {
             commands: Some(cmd_tx),
             thread_handle: Some(handle),
+            flush_lock: tokio::sync::Mutex::new(()),
+            finalized: finalize,
         })
     }
 
     pub fn is_invalid(&self) -> bool {
+        if *self.finalized.borrow() {
+            return true;
+        }
         if let Some(handle) = self.thread_handle.as_ref() {
             return handle.is_finished();
         }
@@ -607,6 +631,9 @@ impl Player {
     }
 
     fn command(&self, cmd: PlayerCommand) {
+        if *self.finalized.borrow() {
+            return;
+        }
         if let Some(commands) = self.commands.as_ref() {
             if let Err(e) = commands.send(cmd) {
                 error!("Player Commands Error: {e}");
@@ -615,10 +642,23 @@ impl Player {
     }
 
     pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+        self.load_with_context(track_id, start_playing, position_ms, None);
+    }
+
+    /// Loads a track with its originating album, playlist, or other context for
+    /// Spotify listening history. Seeking and pausing do not create new listens.
+    pub fn load_with_context(
+        &self,
+        track_id: SpotifyUri,
+        start_playing: bool,
+        position_ms: u32,
+        context_uri: Option<String>,
+    ) {
         self.command(PlayerCommand::Load {
             track_id,
             play: start_playing,
             position_ms,
+            context_uri,
         });
     }
 
@@ -649,6 +689,35 @@ impl Player {
 
     pub fn stop(&self) {
         self.command(PlayerCommand::Stop)
+    }
+
+    /// Stops playback and waits for all queued listening reports, including the
+    /// final partial listen. Call before shutting down the session or runtime.
+    pub async fn stop_and_flush(&self) -> PlayerResult {
+        if *self.finalized.borrow() {
+            return Err(Error::aborted("Player was finalized"));
+        }
+        let _flush = self.flush_lock.lock().await;
+        if *self.finalized.borrow() {
+            return Err(Error::aborted("Player was finalized"));
+        }
+        let (done, completed) = oneshot::channel();
+        self.command(PlayerCommand::StopAndFlush(done));
+        completed.await?.flush().await
+    }
+
+    /// Finish this player's lifetime without waiting for native output or
+    /// decoder calls that cannot be interrupted. Call after `stop_and_flush`,
+    /// or after its application-level deadline expires, and after stopping the
+    /// Connect producer. This is terminal: commands, loaders and reports stop.
+    /// A blocked native call may retain its thread until it returns, but cannot
+    /// start further playback afterward. Ordinary `Drop` still joins threads.
+    pub fn finalize_shutdown(&self) {
+        self.finalized.send_replace(true);
+        // Wake an idle player without allowing queued commands to run first.
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(PlayerCommand::Stop);
+        }
     }
 
     pub fn seek(&self, position_ms: u32) {
@@ -755,6 +824,10 @@ impl Drop for Player {
         debug!("Shutting down player thread ...");
         self.commands = None;
         if let Some(handle) = self.thread_handle.take() {
+            if *self.finalized.borrow() && !handle.is_finished() {
+                debug!("Finalized player thread will release its native output when it returns");
+                return;
+            }
             if let Err(e) = handle.join() {
                 error!("Player thread Error: {e:?}");
             }
@@ -767,6 +840,7 @@ struct PlayerLoadedTrackData {
     normalisation_data: NormalisationData,
     stream_loader_controller: StreamLoaderController,
     audio_item: AudioItem,
+    audio_file: Option<LoadedAudioFile>,
     bytes_per_second: usize,
     duration_ms: u32,
     stream_position_ms: u32,
@@ -816,6 +890,7 @@ enum PlayerState {
         play_request_id: u64,
         decoder: Decoder,
         audio_item: AudioItem,
+        audio_file: Option<LoadedAudioFile>,
         normalisation_data: NormalisationData,
         normalisation_factor: f64,
         stream_loader_controller: StreamLoaderController,
@@ -831,6 +906,7 @@ enum PlayerState {
         decoder: Decoder,
         normalisation_data: NormalisationData,
         audio_item: AudioItem,
+        audio_file: Option<LoadedAudioFile>,
         normalisation_factor: f64,
         stream_loader_controller: StreamLoaderController,
         bytes_per_second: usize,
@@ -905,6 +981,7 @@ impl PlayerState {
                 stream_position_ms,
                 is_explicit,
                 audio_item,
+                audio_file,
                 ..
             } => {
                 *self = EndOfTrack {
@@ -915,6 +992,7 @@ impl PlayerState {
                         normalisation_data,
                         stream_loader_controller,
                         audio_item,
+                        audio_file,
                         bytes_per_second,
                         duration_ms,
                         stream_position_ms,
@@ -938,6 +1016,7 @@ impl PlayerState {
                 play_request_id,
                 decoder,
                 audio_item,
+                audio_file,
                 normalisation_data,
                 normalisation_factor,
                 stream_loader_controller,
@@ -952,6 +1031,7 @@ impl PlayerState {
                     play_request_id,
                     decoder,
                     audio_item,
+                    audio_file,
                     normalisation_data,
                     normalisation_factor,
                     stream_loader_controller,
@@ -980,6 +1060,7 @@ impl PlayerState {
                 play_request_id,
                 decoder,
                 audio_item,
+                audio_file,
                 normalisation_data,
                 normalisation_factor,
                 stream_loader_controller,
@@ -995,6 +1076,7 @@ impl PlayerState {
                     play_request_id,
                     decoder,
                     audio_item,
+                    audio_file,
                     normalisation_data,
                     normalisation_factor,
                     stream_loader_controller,
@@ -1439,6 +1521,10 @@ impl PlayerTrackLoader {
             stream_loader_controller.set_stream_mode();
 
             let is_explicit = audio_item.is_explicit;
+            let audio_file = Some(LoadedAudioFile {
+                id: file_id,
+                format,
+            });
 
             info!("<{}> ({} ms) loaded", audio_item.name, duration_ms);
 
@@ -1447,6 +1533,7 @@ impl PlayerTrackLoader {
                 normalisation_data,
                 stream_loader_controller,
                 audio_item,
+                audio_file,
                 bytes_per_second,
                 duration_ms,
                 stream_position_ms,
@@ -1530,6 +1617,7 @@ impl PlayerTrackLoader {
             duration_ms: duration.as_millis() as u32,
             stream_position_ms,
             is_explicit: false,
+            audio_file: None,
             audio_item: AudioItem {
                 duration_ms: duration.as_millis() as u32,
                 uri: track_uri.to_uri(),
@@ -1567,6 +1655,9 @@ impl Future for PlayerInternal {
         let passthrough = self.config.passthrough;
 
         loop {
+            if *self.finalized.borrow() {
+                return Poll::Ready(());
+            }
             let mut all_futures_completed_or_not_ready = true;
 
             // process commands that were sent to us
@@ -1583,6 +1674,9 @@ impl Future for PlayerInternal {
                 if let Err(e) = self.handle_command(cmd) {
                     error!("Error handling command: {e}");
                 }
+            }
+            if *self.finalized.borrow() {
+                return Poll::Ready(());
             }
 
             // Handle loading of a new track to play
@@ -1606,6 +1700,9 @@ impl Future for PlayerInternal {
                                 loaded_track,
                                 start_playback,
                             );
+                            if *self.finalized.borrow() {
+                                return Poll::Ready(());
+                            }
                             if let PlayerState::Loading { .. } = self.state {
                                 error!("The state wasn't changed by start_playback()");
                                 exit(1);
@@ -1674,6 +1771,9 @@ impl Future for PlayerInternal {
 
             if self.state.is_playing() {
                 self.ensure_sink_running();
+                if *self.finalized.borrow() {
+                    return Poll::Ready(());
+                }
 
                 if let PlayerState::Playing {
                     ref track_id,
@@ -1840,13 +1940,53 @@ impl Future for PlayerInternal {
 }
 
 impl PlayerInternal {
+    fn set_listening(&mut self, mut statistics: Option<PlaybackStatistics>) {
+        if let Some(statistics) = &mut statistics {
+            statistics.configure_output(self.sink.as_mut());
+        } else {
+            self.sink.set_rendered_audio(None);
+        }
+        self.listening = statistics;
+    }
+
+    fn take_listening(&mut self, reason: EndReason) -> Option<ReportCommand> {
+        self.listening
+            .take()
+            .and_then(|stats| stats.pending(reason, SystemTime::now()))
+            .map(|report| {
+                ReportCommand::Report(
+                    self.listening_generation,
+                    self.session.clone(),
+                    Box::new(report),
+                )
+            })
+    }
+
+    fn finish_listening(&mut self, reason: EndReason) {
+        if let Some(report) = self.take_listening(reason) {
+            if self.listening_reports.try_send(report).is_err() {
+                warn!("Listening report queue is full or closed; dropping completed report");
+                self.listening_error = Some(Error::unavailable(
+                    "A completed listening report could not be queued",
+                ));
+            }
+        }
+    }
+
     fn ensure_sink_running(&mut self) {
+        if *self.finalized.borrow() {
+            return;
+        }
         if self.sink_status != SinkStatus::Running {
             trace!("== Starting sink ==");
             if let Some(callback) = &mut self.sink_event_callback {
                 callback(SinkStatus::Running);
             }
-            match self.sink.start() {
+            let result = self.sink.start();
+            if *self.finalized.borrow() {
+                return;
+            }
+            match result {
                 Ok(()) => self.sink_status = SinkStatus::Running,
                 Err(e) => {
                     error!("{e}");
@@ -1890,6 +2030,7 @@ impl PlayerInternal {
     }
 
     fn handle_player_stop(&mut self) {
+        self.finish_listening(EndReason::EndPlay);
         match self.state {
             PlayerState::Playing {
                 ref track_id,
@@ -1991,6 +2132,9 @@ impl PlayerInternal {
         packet: Option<(AudioPacketPosition, AudioPacket)>,
         normalisation_factor: f64,
     ) {
+        if *self.finalized.borrow() {
+            return;
+        }
         match packet {
             Some((_, mut packet)) => {
                 if !packet.is_empty() {
@@ -2087,14 +2231,30 @@ impl PlayerInternal {
                         }
                     }
 
-                    if let Err(e) = self.sink.write(packet, &mut self.converter) {
-                        error!("{e}");
-                        self.handle_pause();
+                    let samples = match &packet {
+                        AudioPacket::Samples(data) => data.len(),
+                        AudioPacket::Raw(_) => 0,
+                    };
+                    let result = self.sink.write(packet, &mut self.converter);
+                    if *self.finalized.borrow() {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => {
+                            if let Some(stats) = &mut self.listening {
+                                stats.written(samples, SystemTime::now());
+                            }
+                        }
+                        Err(e) => {
+                            error!("{e}");
+                            self.handle_pause();
+                        }
                     }
                 }
             }
 
             None => {
+                self.finish_listening(EndReason::TrackDone);
                 self.state.playing_to_end_of_track();
                 if let PlayerState::EndOfTrack {
                     ref track_id,
@@ -2121,6 +2281,17 @@ impl PlayerInternal {
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
     ) {
+        if *self.finalized.borrow() {
+            return;
+        }
+        let listening = loaded_track.audio_file.map(|file| {
+            PlaybackStatistics::new(
+                loaded_track.audio_item.track_id.clone(),
+                file,
+                self.context_uri.clone(),
+            )
+        });
+        self.set_listening(listening);
         let audio_item = Box::new(loaded_track.audio_item.clone());
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
@@ -2154,6 +2325,7 @@ impl PlayerInternal {
                 play_request_id,
                 decoder: loaded_track.decoder,
                 audio_item: loaded_track.audio_item,
+                audio_file: loaded_track.audio_file,
                 normalisation_data: loaded_track.normalisation_data,
                 normalisation_factor,
                 stream_loader_controller: loaded_track.stream_loader_controller,
@@ -2173,6 +2345,7 @@ impl PlayerInternal {
                 play_request_id,
                 decoder: loaded_track.decoder,
                 audio_item: loaded_track.audio_item,
+                audio_file: loaded_track.audio_file,
                 normalisation_data: loaded_track.normalisation_data,
                 normalisation_factor,
                 stream_loader_controller: loaded_track.stream_loader_controller,
@@ -2198,6 +2371,7 @@ impl PlayerInternal {
         play: bool,
         position_ms: u32,
     ) -> PlayerResult {
+        self.finish_listening(EndReason::EndPlay);
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
@@ -2280,6 +2454,7 @@ impl PlayerInternal {
                     stream_position_ms,
                     decoder,
                     audio_item,
+                    audio_file,
                     stream_loader_controller,
                     bytes_per_second,
                     duration_ms,
@@ -2291,6 +2466,7 @@ impl PlayerInternal {
                     stream_position_ms,
                     decoder,
                     audio_item,
+                    audio_file,
                     stream_loader_controller,
                     bytes_per_second,
                     duration_ms,
@@ -2304,6 +2480,7 @@ impl PlayerInternal {
                         normalisation_data,
                         stream_loader_controller,
                         audio_item,
+                        audio_file,
                         bytes_per_second,
                         duration_ms,
                         stream_position_ms,
@@ -2556,13 +2733,20 @@ impl PlayerInternal {
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
+        if *self.finalized.borrow() {
+            return Ok(());
+        }
         debug!("command={cmd:?}");
         match cmd {
             PlayerCommand::Load {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                context_uri,
+            } => {
+                self.context_uri = context_uri.filter(|uri| !uri.is_empty());
+                self.handle_command_load(track_id, None, play, position_ms)?;
+            }
 
             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
 
@@ -2576,7 +2760,23 @@ impl PlayerInternal {
 
             PlayerCommand::Stop => self.handle_player_stop(),
 
-            PlayerCommand::SetSession(session) => self.session = session,
+            PlayerCommand::StopAndFlush(done) => {
+                let final_report = self.take_listening(EndReason::EndPlay);
+                self.handle_player_stop();
+                let _ = done.send(PendingFlush {
+                    sender: self.listening_reports.clone(),
+                    final_report,
+                    previous_error: self.listening_error.take(),
+                });
+            }
+
+            PlayerCommand::SetSession(session) => {
+                let remaining = self.listening.as_ref().map(PlaybackStatistics::restart);
+                self.finish_listening(EndReason::EndPlay);
+                self.session = session;
+                self.listening_generation = self.listening_generation.wrapping_add(1);
+                self.set_listening(remaining);
+            }
 
             PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),
 
@@ -2708,10 +2908,18 @@ impl PlayerInternal {
 
         let load_handles_clone = self.load_handles.clone();
         let handle = tokio::runtime::Handle::current();
+        let finalized = self.finalized.clone();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms, prefetched));
-            let _ = result_tx.send(data);
+            let data = handle.block_on(listening::until_finalized(
+                finalized.clone(),
+                loader.load_track(spotify_uri, position_ms, prefetched),
+            ));
+            if !*finalized.borrow()
+                && let Some(data) = data
+            {
+                let _ = result_tx.send(data);
+            }
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
             load_handles.remove(&thread::current().id());
@@ -2750,6 +2958,9 @@ impl PlayerInternal {
 
 impl Drop for PlayerInternal {
     fn drop(&mut self) {
+        if !*self.finalized.borrow() {
+            self.finish_listening(EndReason::EndPlay);
+        }
         debug!("drop PlayerInternal[{}]", self.player_id);
 
         let handles: Vec<thread::JoinHandle<()>> = {
@@ -2763,7 +2974,9 @@ impl Drop for PlayerInternal {
         };
 
         for handle in handles {
-            let _ = handle.join();
+            if !*self.finalized.borrow() || handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -2791,6 +3004,7 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::Play => f.debug_tuple("Play").finish(),
             PlayerCommand::Pause => f.debug_tuple("Pause").finish(),
             PlayerCommand::Stop => f.debug_tuple("Stop").finish(),
+            PlayerCommand::StopAndFlush(_) => f.debug_tuple("StopAndFlush").finish(),
             PlayerCommand::Seek(position) => f.debug_tuple("Seek").field(&position).finish(),
             PlayerCommand::SetSession(_) => f.debug_tuple("SetSession").finish(),
             PlayerCommand::AddEventSender(_) => f.debug_tuple("AddEventSender").finish(),
@@ -2972,8 +3186,95 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadError, PlayerEvent, PlayerTrackLoader};
+    use super::{LoadError, Player, PlayerCommand, PlayerEvent, PlayerTrackLoader};
     use crate::core::{Error, SpotifyUri, audio_key::AudioKeyError};
+
+    fn player_with_thread(
+        thread_handle: Option<std::thread::JoinHandle<()>>,
+    ) -> (Player, tokio::sync::mpsc::UnboundedReceiver<PlayerCommand>) {
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (finalized, _) = tokio::sync::watch::channel(false);
+        (
+            Player {
+                commands: Some(commands),
+                thread_handle,
+                flush_lock: tokio::sync::Mutex::new(()),
+                finalized,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn finalized_player_drop_does_not_join_a_stalled_native_thread() {
+        let (release, released) = std::sync::mpsc::channel();
+        let (native_done, native_finished) = std::sync::mpsc::channel();
+        let native = std::thread::spawn(move || {
+            released.recv().unwrap();
+            native_done.send(()).unwrap();
+        });
+        let (player, _commands) = player_with_thread(Some(native));
+        let (dropped, finished) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            player.finalize_shutdown();
+            drop(player);
+            dropped.send(()).unwrap();
+        });
+        let bounded = finished
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        // Release the stand-in native call even when the assertion would fail.
+        release.send(()).unwrap();
+        native_finished
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        dropper.join().unwrap();
+        assert!(bounded, "finalized Drop must not wait for native output");
+    }
+
+    #[test]
+    fn ordinary_player_drop_still_joins_its_native_thread() {
+        let (release, released) = std::sync::mpsc::channel();
+        let native = std::thread::spawn(move || {
+            released.recv().unwrap();
+        });
+        let (player, _commands) = player_with_thread(Some(native));
+        let (dropping, began_drop) = std::sync::mpsc::channel();
+        let (dropped, finished) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            dropping.send(()).unwrap();
+            drop(player);
+            dropped.send(()).unwrap();
+        });
+        began_drop.recv().unwrap();
+        let waited = finished
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err();
+        release.send(()).unwrap();
+        if waited {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        }
+        dropper.join().unwrap();
+        assert!(waited, "ordinary Drop retains its existing join semantics");
+    }
+
+    #[tokio::test]
+    async fn finalization_rejects_new_playback_and_flush_commands() {
+        let (player, mut commands) = player_with_thread(None);
+        player.finalize_shutdown();
+        assert!(matches!(commands.try_recv(), Ok(PlayerCommand::Stop)));
+        player.play();
+        player.load(
+            SpotifyUri::from_uri("spotify:track:14XWXWv5FoCbFzLksawpEe").unwrap(),
+            true,
+            0,
+        );
+        assert!(commands.try_recv().is_err(), "finalization is terminal");
+        assert!(player.is_invalid());
+        assert!(player.stop_and_flush().await.is_err());
+    }
 
     #[test]
     fn only_an_explicit_audio_key_rejection_is_terminal() {

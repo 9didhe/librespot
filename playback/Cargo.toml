@@ -101,6 +101,7 @@ form_urlencoded = "1.2.2"
 [dev-dependencies]
 # WAV, so the decoder tests can build files at any rate and channel layout.
 symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm"] }
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true
