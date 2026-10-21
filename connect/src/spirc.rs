@@ -2810,8 +2810,16 @@ mod tests {
             cluster_update_sender: broadcast::channel(1).0,
             queue_update_sender: broadcast::channel(1).0,
             player_state_sender: watch::channel(None).0,
-            cluster_state_sender: watch::channel(ClusterState::default()).0,
-            queue_list_sender: watch::channel(QueueList::default()).0,
+            cluster_state_sender: watch::channel(ClusterState {
+                devices: HashMap::new(),
+                active_device_id: None,
+            })
+            .0,
+            queue_list_sender: watch::channel(QueueList {
+                prev_tracks: Vec::new(),
+                next_tracks: Vec::new(),
+            })
+            .0,
         };
         spirc.shutdown_preserving_player().unwrap();
         assert!(matches!(
