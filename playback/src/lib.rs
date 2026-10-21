@@ -10,9 +10,12 @@ pub mod config;
 pub mod convert;
 pub mod decoder;
 pub mod dither;
+pub mod listening;
 pub mod local_file;
 pub mod mixer;
 pub mod player;
+#[cfg(any(feature = "pulseaudio-backend", test))]
+mod rendered_queue;
 mod resample;
 mod symphonia_util;
 

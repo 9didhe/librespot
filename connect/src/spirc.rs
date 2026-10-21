@@ -251,6 +251,7 @@ enum SpircCommand {
     VolumeUp,
     VolumeDown,
     Shutdown,
+    ShutdownKeepPlayer,
     Shuffle(bool),
     Repeat(bool),
     RepeatTrack(bool),
@@ -555,6 +556,11 @@ impl Spirc {
     /// bring the future initially returned to an end.
     pub fn shutdown(&self) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Shutdown)?)
+    }
+
+    /// Ends only this connection while another connection takes over its player.
+    pub fn shutdown_preserving_player(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::ShutdownKeepPlayer)?)
     }
 
     /// Resumes the playback
@@ -1043,15 +1049,26 @@ impl SpircTask {
     async fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
         trace!("Received SpircCommand::{cmd:?}");
         match cmd {
-            SpircCommand::Shutdown => {
+            command @ (SpircCommand::Shutdown | SpircCommand::ShutdownKeepPlayer) => {
                 trace!("Received SpircCommand::Shutdown");
-                self.handle_pause();
-                self.handle_disconnect().await?;
-                self.publish_local_activation(false);
+                // Reject new commands before the final drain. This branch
+                // owns the event loop, so no remote transition can run either.
                 self.shutdown = true;
                 if let Some(rx) = self.commands.as_mut() {
                     rx.close()
                 }
+                if matches!(command, SpircCommand::Shutdown)
+                    && let Err(error) =
+                        tokio::time::timeout(Duration::from_secs(10), self.player.stop_and_flush())
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(Error::deadline_exceeded("Listening flush timed out"))
+                            })
+                {
+                    warn!("Unable to flush listening on shutdown: {error}");
+                }
+                self.handle_disconnect().await?;
+                self.publish_local_activation(false);
             }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
                 let device_id = self.session.device_id();
@@ -2465,7 +2482,12 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+        self.player.load_with_context(
+            id,
+            start_playing,
+            position_ms,
+            Some(self.connect_state.context_uri().clone()),
+        );
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
@@ -2777,6 +2799,28 @@ fn classify_player_update_reasons(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_a_connection_can_preserve_its_player_for_a_replacement() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let spirc = Spirc {
+            commands,
+            disconnected_playback: Arc::default(),
+            player_update_sender: broadcast::channel(1).0,
+            cluster_update_sender: broadcast::channel(1).0,
+            queue_update_sender: broadcast::channel(1).0,
+            player_state_sender: watch::channel(None).0,
+            cluster_state_sender: watch::channel(ClusterState::default()).0,
+            queue_list_sender: watch::channel(QueueList::default()).0,
+        };
+        spirc.shutdown_preserving_player().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SpircCommand::ShutdownKeepPlayer)
+        ));
+        spirc.shutdown().unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(SpircCommand::Shutdown)));
+    }
 
     fn state_with(f: impl FnOnce(&mut PlayerState)) -> PlayerState {
         let mut state = PlayerState::default();

@@ -1,6 +1,8 @@
 use crate::config::AudioFormat;
 use crate::convert::Converter;
 use crate::decoder::AudioPacket;
+use crate::listening::RenderedAudio;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,6 +26,13 @@ pub trait Open {
 }
 
 pub trait Sink {
+    /// Buffered sinks can account for frames when their output consumes them.
+    /// Return true when the sink implements this hook; otherwise the player
+    /// retains its accepted-sample accounting for synchronous sinks.
+    fn set_rendered_audio(&mut self, _: Option<Arc<RenderedAudio>>) -> bool {
+        false
+    }
+
     fn start(&mut self) -> SinkResult<()> {
         Ok(())
     }
