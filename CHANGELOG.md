@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [playback] Add `AudioKeyUnavailable` player event, emitted when Spotify refuses the audio key of the track being loaded (breaking)
 - [playback] Make the `local_file` module public, and add `LocalFileLookup::iter`, `len` and `is_empty`, so applications can list the local files the player can play
 - [core] Add method `post_playlist_changes` to `SpClient` to add, remove or move playlist rows by index, as Spotify's own clients do; it sends the change once
-- [playback] Add `Player::prefetch` to fetch the metadata, audio key and first 128 KiB of upcoming tracks, so loading one of them starts playing without waiting for those in turn; `Spirc` prefetches the next two tracks
+- [playback] Add `Player::prefetch` to fetch the metadata and first 128 KiB of upcoming tracks, and the audio key of the next one, so loading one of them starts playing without waiting for those in turn; `Spirc` prefetches the next two tracks. The key is not prefetched while the session backs off after a refused key
 - [audio] Add `AudioFileHead` and `AudioFile::open_with_head` to open a file from its first bytes fetched ahead of time
 - [core] Add `SpClient::get_collection_page` and `SpClient::write_collection` to read and change the user's collection sets, such as `playcontextbans`, the tracks hidden in a playlist
 
