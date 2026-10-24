@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [core] Ask for audio keys one at a time and at least 200 ms apart, and after Spotify refuses one wait 3, then 5, then 10 seconds before asking for another, so a burst of requests no longer prolongs a run of refusals; `AudioKeyManager::request` asks again for a refused key up to three times
 - [playback] Resample stereo local files to 44.1 kHz, including the final audio frames, and clear the resampler history when seeking
 - [playback] Play local files with any channel count: mono plays on both sides and surround is mixed down to stereo, and the resampling filter lengthens with the rate ratio so 96 and 192 kHz files are rejected above 22 kHz as cleanly as 48 kHz ones
 
 ### Added
 
+- [core] Add `AudioKeyManager::try_request`, which asks for a key once and not at all while the session waits after a refusal, and `AudioKeyManager::is_backing_off`; `AudioKeyError` gains a `BackingOff` variant (breaking)
 - [core] Add `SpClient::get_buddylist` and `SpClient::get_listening_activity` to read what the people the user follows are listening to
 - [core] Add `Cache::with_memory_credentials` to keep credentials in memory instead of a file, for applications that store them in their own protected store
 - [connect] Retain playback snapshots after an unexpected disconnect so clients can restore context, shuffle order, and queued tracks on a new session
