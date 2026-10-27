@@ -3426,7 +3426,8 @@ mod prefetch_tests {
 #[cfg(test)]
 mod abandoned_load_tests {
     use super::unless_abandoned;
-    use tokio::sync::oneshot;
+    use crate::listening;
+    use tokio::sync::{oneshot, watch};
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
@@ -3449,6 +3450,29 @@ mod abandoned_load_tests {
         let output = block_on(unless_abandoned(
             &mut result_tx,
             std::future::pending::<u32>(),
+        ));
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn reporting_finalization_stops_a_load_that_is_still_waited_for() {
+        let (mut result_tx, _result_rx) = oneshot::channel::<u32>();
+        let (_finalize, finalized) = watch::channel(true);
+        let output = block_on(unless_abandoned(
+            &mut result_tx,
+            listening::until_finalized(finalized, std::future::pending::<u32>()),
+        ));
+        assert_eq!(output, Some(None));
+    }
+
+    #[test]
+    fn abandoning_a_load_does_not_wait_for_reporting_finalization() {
+        let (mut result_tx, result_rx) = oneshot::channel::<u32>();
+        let (_finalize, finalized) = watch::channel(false);
+        drop(result_rx);
+        let output = block_on(unless_abandoned(
+            &mut result_tx,
+            listening::until_finalized(finalized, std::future::pending::<u32>()),
         ));
         assert_eq!(output, None);
     }
